@@ -1,0 +1,129 @@
+# mantel_plot.R  ── full‑matrix heat‑map, Mantel curves only for XCO2 / ODIAC / GPP / SIF
+# -----------------------------------------------------------------------------
+#  • Heat‑map: ALL variables listed in FILES (order preserved)
+#  • Curved Mantel links: only edges that involve one of the four focal
+#    variables (XCO2, ODIAC, GPP, SIF)
+#  • Palette: RdBu diverging (red = positive, blue = negative)
+# -----------------------------------------------------------------------------
+#  INPUT
+#      GeoTIFF stacks (one per variable) in DATA_DIR, each monthly 2014‑01 → 2024‑03.
+#  OUTPUT
+#      pcmci_results/figures/mantel_corr_focus_links.png  (400 dpi)
+#      pcmci_results/mantel_results.csv                   (Mantel r & p values)
+# -----------------------------------------------------------------------------
+
+# ═════ USER PARAMS ════════════════════════════════════════════════════════════
+DATA_DIR  <- "D:/DATA_NATURE_SIF/ALL_DAILY_STACKED/daily/monthly"  # folder path
+
+FILES <- c(
+  XCO2  = "XCO2.tif",  EDGAR = "08_TOTAL.tif",  GPP  = "GPP.tif",
+  RO    = "RO.tif",    SR    = "SR.tif",    SP   = "SP.tif",   T2M   = "T2M.tif",
+  TE    = "TE.tif",    TP    = "TP.tif",    VT   = "VT.tif",   VSW   = "VSW.tif",
+  WS    = "WS.tif")
+
+FOCAL_VARS <- c("XCO2", "ODIAC", "GPP", "SIF")    # variables to draw Mantel links
+
+DATE_INDEX   <- seq.Date(as.Date("2014-01-01"), as.Date("2024-03-01"), by = "month")
+CORR_METHOD  <- "pearson"     # pearson | spearman
+PERMUTATIONS <- 999
+FIG_DPI      <- 400
+# ═════════════════════════════════════════════════════════════════════════════
+
+OUT_DIR <- file.path(DATA_DIR, "pcmci_results"); if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR)
+FIG_DIR <- file.path(OUT_DIR,  "figures");      if (!dir.exists(FIG_DIR)) dir.create(FIG_DIR)
+
+# verify GeoTIFFs exist --------------------------------------------------------
+missing_files <- FILES[!file.exists(file.path(DATA_DIR, FILES))]
+if (length(missing_files))
+  stop("Missing raster files: ", paste(names(missing_files), collapse = ", "))
+
+suppressPackageStartupMessages({
+  library(terra); library(dplyr); library(tidyr); library(purrr);
+  library(vegan); library(linkET); library(ggplot2)
+})
+
+# helper: read raster and return global‑mean time‑series -----------------------
+read_series <- function(fname) {
+  r <- rast(file.path(DATA_DIR, fname))[[1:length(DATE_INDEX)]]
+  tibble(date = DATE_INDEX,
+         value = as.numeric(global(r, fun = "mean", na.rm = TRUE)[, 1]))
+}
+
+# build wide data.frame (date + variables) ------------------------------------
+message("📦 Loading rasters …")
+TS_df <- imap_dfc(FILES, ~ read_series(.x) %>% select(value) %>% set_names(.y)) %>%
+         mutate(date = DATE_INDEX, .before = 1)
+num_mat <- TS_df %>% select(-date)
+message("   → ", ncol(num_mat), " variables × ", nrow(num_mat), " months")
+
+# correlation matrix -----------------------------------------------------------
+message("🔗 Computing correlation matrix …")
+corr_mat <- cor(num_mat, use = "pairwise.complete.obs", method = CORR_METHOD)
+
+# Mantel tests (all pairs) -----------------------------------------------------
+message("🧮 Running Mantel tests … (", PERMUTATIONS, " perms)")
+all_pairs <- combn(colnames(num_mat), 2, simplify = FALSE)
+res <- map_dfr(all_pairs, function(vars) {
+  df <- num_mat %>% select(all_of(vars)) %>% drop_na()
+  if (nrow(df) < 12) return(NULL)
+  d1 <- dist(df[[1]], method = "euclidean"); d2 <- dist(df[[2]], method = "euclidean")
+  m  <- vegan::mantel(d1, d2, permutations = PERMUTATIONS, method = "pearson")
+  tibble(var1 = vars[1], var2 = vars[2], r = m$statistic, p = m$signif)
+})
+write.csv(res, file.path(OUT_DIR, "mantel_results.csv"), row.names = FALSE)
+
+# keep edges involving a focal variable ---------------------------------------
+edges <- res %>%
+  filter(var1 %in% FOCAL_VARS | var2 %in% FOCAL_VARS) %>%
+  mutate(
+    rd = cut(r, breaks = c(-Inf, 0.2, 0.4, Inf), labels = c("<0.2", "0.2‑0.4", "≥0.4")),
+    pd = cut(p, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("<0.01", "0.01‑0.05", "≥0.05"))
+  )
+
+# plotting --------------------------------------------------------------------
+message("🎨 Rendering figure …")
+set_corrplot_style(scale = ggplot2::scale_fill_distiller(palette = "RdBu", direction = 1))
+
+g <- qcorrplot(corr_mat, type = "upper", diag = FALSE) +
+  geom_square() +
+  geom_couple(
+    data      = edges,
+    mapping   = aes(colour = pd, size = rd),
+    curvature = 0.2
+  ) +
+  scale_size_manual(values = c(0.4, 0.8, 1.6), name = "Mantel's r") +
+  scale_colour_manual(values = linkET:::color_pal(3), name = "Mantel's p") +
+  guides(fill = guide_colorbar(title = paste0(CORR_METHOD, " r"))) +
+  #labs(title = paste0("Mantel links for XCO2 / ODIAC / GPP / SIF (n = ", nrow(num_mat), " months)")) +
+  theme(
+    axis.text.x.top = element_text(angle = 45, hjust = 0),
+    plot.title      = element_text(size = 12, face = "bold"),
+    axis.text.y     = element_text(face = ifelse(rownames(corr_mat) %in% FOCAL_VARS, "bold", "plain")),
+    axis.text.x     = element_text(face = ifelse(colnames(corr_mat) %in% FOCAL_VARS, "bold", "plain"))
+  )
+
+ggsave(file.path(FIG_DIR, "mantel_corr_focus_links.png"), g, dpi = FIG_DPI, width = 8, height = 6)
+message("✅ Figure saved → ", file.path(FIG_DIR, "mantel_corr_focus_links.png"))
+
+# END
+
+
+# keep edges involving a focal variable ---------------------------------------
+edges <- res %>%
+    filter(var1 %in% FOCAL_VARS | var2 %in% FOCAL_VARS) %>%
+    mutate(
+        rd = cut(r,   breaks = c(-Inf, 0.2, 0.4, Inf),
+                   labels = c("<0.2", "0.2-0.4", "≥0.4")),
+        pd = cut(p,   breaks = c(-Inf, 0.01, 0.05, Inf),
+                   labels = c("<0.01", "0.01-0.05", "≥0.05"))
+    )
+
+# export the focal‐links table -----------------------------------------------
+write.csv(
+  edges,
+  file.path(OUT_DIR, "mantel_focus_links.csv"),
+  row.names = FALSE
+)
+message("✅ Focal connections saved → ",
+        file.path(OUT_DIR, "mantel_focus_links.csv"))
+
